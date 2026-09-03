@@ -20,6 +20,7 @@ import json
 import time
 from io import BytesIO
 
+import streamlit as st
 from anthropic import Anthropic, APIConnectionError, APIStatusError, AuthenticationError
 from pypdf import PdfReader
 
@@ -29,12 +30,20 @@ _client = None
 
 
 def get_client():
-    """Create the Anthropic client lazily, on first real use — not at import time."""
+    """Create the Anthropic client using Streamlit Secrets."""
     global _client
-    if _client is None:
-        _client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
-    return _client
 
+    if _client is None:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is missing from Streamlit Secrets."
+            )
+
+        _client = Anthropic(api_key=api_key)
+
+    return _client
 
 def check_api_connection() -> dict:
     """
