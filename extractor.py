@@ -1,203 +1,408 @@
 """
-extractor.py (hardened)
+extractor.py
 
-Key fixes from the first version:
-  1. The Anthropic client is no longer created at import time. Before, if
-     ANTHROPIC_API_KEY was missing or empty when the app started, the whole
-     app would crash on startup — which is exactly what produces a blank
-     501/502 from Replit's proxy (app never came up, so there's nothing to
-     route to).
-  2. Every external call (API, file parsing) is wrapped so failures return
-     a clear error dict instead of raising and killing the app.
-  3. Added a short retry on transient API errors, since flaky network blips
-     otherwise look identical to "the app is broken."
-  4. Added a standalone check_api_connection() used by the self-test panel
-     in app.py, so you can verify the API key works BEFORE uploading a doc.
+Gemini-powered insurance claims extraction.
+
+This module:
+  1. Reads the Gemini API key securely from Streamlit Secrets.
+  2. Extracts text from PDFs and TXT files.
+  3. Uses Gemini vision for scanned/image claim documents.
+  4. Extracts structured claim data as JSON.
+  5. Includes a self-test API connection check.
+  6. Returns clear errors instead of crashing the Streamlit app.
 """
 
-import base64
 import json
 import time
 from io import BytesIO
 
 import streamlit as st
-from anthropic import Anthropic, APIConnectionError, APIStatusError, AuthenticationError
+from google import genai
+from google.genai import types
 from pypdf import PdfReader
 
-MODEL = "claude-sonnet-4-6"
+
+# Gemini model
+MODEL = "gemini-2.5-flash"
 
 _client = None
 
 
 def get_client():
-    """Create the Anthropic client using Streamlit Secrets."""
+    """Create the Gemini client using Streamlit Secrets."""
     global _client
 
     if _client is None:
-        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+        api_key = st.secrets.get("GEMINI_API_KEY")
 
         if not api_key:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY is missing from Streamlit Secrets."
+                "GEMINI_API_KEY is missing from Streamlit Secrets."
             )
 
-        _client = Anthropic(api_key=api_key)
+        _client = genai.Client(api_key=api_key)
 
     return _client
 
+
 def check_api_connection() -> dict:
     """
-    Cheap, fast call to confirm the API key + network actually work.
-    Returns {"ok": True} or {"ok": False, "error": "..."} — never raises.
+    Cheap, fast call to confirm the Gemini API key and connection work.
+
+    Returns:
+        {"ok": True}
+
+    or:
+
+        {"ok": False, "error": "..."}
     """
     try:
         client = get_client()
-        client.messages.create(
+
+        response = client.models.generate_content(
             model=MODEL,
-            max_tokens=10,
-            messages=[{"role": "user", "content": "Reply with just: ok"}],
+            contents="Reply with just: ok",
+            config=types.GenerateContentConfig(
+                max_output_tokens=10,
+            ),
         )
-        return {"ok": True}
-    except AuthenticationError:
-        return {"ok": False, "error": "Invalid or missing ANTHROPIC_API_KEY. Check your Replit Secret."}
-    except APIConnectionError:
-        return {"ok": False, "error": "Could not reach the Anthropic API (network issue)."}
-    except APIStatusError as e:
-        return {"ok": False, "error": f"API returned an error: {e.status_code} — {e.message}"}
+
+        if response.text:
+            return {"ok": True}
+
+        return {
+            "ok": False,
+            "error": "Gemini returned an empty response.",
+        }
+
     except Exception as e:
-        return {"ok": False, "error": f"Unexpected error: {e}"}
+        error_text = str(e)
+
+        if "API key" in error_text or "401" in error_text or "403" in error_text:
+            return {
+                "ok": False,
+                "error": "Gemini authentication failed. Check GEMINI_API_KEY in Streamlit Secrets.",
+            }
+
+        if "429" in error_text or "quota" in error_text.lower():
+            return {
+                "ok": False,
+                "error": "Gemini API quota/rate limit reached. Please try again later.",
+            }
+
+        return {
+            "ok": False,
+            "error": f"Gemini API error: {error_text}",
+        }
 
 
 # ---------------------------------------------------------------------------
-# Extraction schema — customize per industry
+# Extraction schema
 # ---------------------------------------------------------------------------
+
 EXTRACTION_SCHEMA = {
-    "policy_number": "string or null",
-    "claimant_name": "string or null",
-    "date_of_incident": "string (YYYY-MM-DD) or null",
-    "date_filed": "string (YYYY-MM-DD) or null",
-    "claim_type": "string, e.g. 'auto', 'property', 'liability', or null",
-    "claimed_amount": "number or null",
-    "policy_limit": "number or null",
-    "description_of_incident": "string, 1-2 sentence summary or null",
-    "supporting_documents_mentioned": "list of strings, e.g. ['photos', 'police report']",
-    "adjuster_notes": "string or null",
+    "type": "object",
+    "properties": {
+        "policy_number": {
+            "type": ["string", "null"],
+            "description": "Insurance policy number, if present.",
+        },
+        "claimant_name": {
+            "type": ["string", "null"],
+            "description": "Name of the claimant, if present.",
+        },
+        "date_of_incident": {
+            "type": ["string", "null"],
+            "description": "Date of incident in YYYY-MM-DD format, if present.",
+        },
+        "date_filed": {
+            "type": ["string", "null"],
+            "description": "Date the claim was filed in YYYY-MM-DD format, if present.",
+        },
+        "claim_type": {
+            "type": ["string", "null"],
+            "description": "Type of claim such as auto, property, liability, etc.",
+        },
+        "claimed_amount": {
+            "type": ["number", "null"],
+            "description": "Amount claimed, if present.",
+        },
+        "policy_limit": {
+            "type": ["number", "null"],
+            "description": "Policy coverage limit, if present.",
+        },
+        "description_of_incident": {
+            "type": ["string", "null"],
+            "description": "One or two sentence summary of the incident.",
+        },
+        "supporting_documents_mentioned": {
+            "type": "array",
+            "items": {
+                "type": "string",
+            },
+            "description": "Supporting documents mentioned in the claim.",
+        },
+        "adjuster_notes": {
+            "type": ["string", "null"],
+            "description": "Adjuster notes, if present.",
+        },
+    },
+    "required": [
+        "policy_number",
+        "claimant_name",
+        "date_of_incident",
+        "date_filed",
+        "claim_type",
+        "claimed_amount",
+        "policy_limit",
+        "description_of_incident",
+        "supporting_documents_mentioned",
+        "adjuster_notes",
+    ],
 }
 
-SYSTEM_PROMPT = f"""You are an intake assistant for an insurance agency.
-You will be given the raw text of a claim form or related document.
-Extract the following fields as JSON, matching this schema exactly:
+
+SYSTEM_PROMPT = f"""
+You are an intake assistant for an insurance agency.
+
+You will be given the raw text of an insurance claim form or related document.
+
+Extract the following fields:
 
 {json.dumps(EXTRACTION_SCHEMA, indent=2)}
 
 Rules:
-- Return ONLY valid JSON. No preamble, no markdown code fences, no commentary.
-- If a field isn't present in the text, use null (or an empty list for list fields).
-- Do not guess or invent values that aren't supported by the text.
-- Dates should be normalized to YYYY-MM-DD where possible.
+- Return ONLY valid JSON.
+- Do not include markdown.
+- Do not include explanations or commentary.
+- If a field is not present, return null.
+- For supporting_documents_mentioned, return an empty list if none are mentioned.
+- Do not guess or invent information.
+- Only extract information supported by the document.
+- Normalize dates to YYYY-MM-DD whenever possible.
+- Keep the incident description concise.
 """
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract selectable text from a PDF."""
     try:
         reader = PdfReader(BytesIO(file_bytes))
-        text = [page.extract_text() or "" for page in reader.pages]
+
+        text = [
+            page.extract_text() or ""
+            for page in reader.pages
+        ]
+
         return "\n".join(text).strip()
+
     except Exception as e:
         raise ValueError(f"Could not parse PDF: {e}")
 
 
-def extract_text_from_image(file_bytes: bytes, media_type: str) -> str:
-    """Uses Claude's vision to read an image (e.g. a scanned form) directly."""
-    b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-    client = get_client()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1500,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": b64},
-                    },
-                    {
-                        "type": "text",
-                        "text": "Transcribe all visible text from this document image, "
-                                "as plainly and completely as possible.",
-                    },
-                ],
-            }
-        ],
-    )
-    return response.content[0].text.strip()
+def extract_text_from_image(
+    file_bytes: bytes,
+    media_type: str
+) -> str:
+    """
+    Use Gemini vision to read text from a scanned claim document.
+    """
+
+    try:
+        client = get_client()
+
+        image_part = types.Part.from_bytes(
+            data=file_bytes,
+            mime_type=media_type,
+        )
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=[
+                image_part,
+                """
+Transcribe all visible text from this insurance claim document.
+
+Read the document carefully and reproduce all visible text as accurately
+and completely as possible.
+
+Do not summarize.
+Do not interpret the information.
+Just return the visible text.
+""",
+            ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=3000,
+            ),
+        )
+
+        if not response.text:
+            raise ValueError(
+                "Gemini returned no text from the image."
+            )
+
+        return response.text.strip()
+
+    except Exception as e:
+        raise ValueError(
+            f"Could not read the document image with Gemini: {e}"
+        )
 
 
 def get_raw_text(uploaded_file) -> str:
-    """Dispatch based on file type. Raises ValueError with a clear message on failure."""
+    """
+    Dispatch based on file type.
+    """
+
     name = uploaded_file.name.lower()
     file_bytes = uploaded_file.read()
 
     if len(file_bytes) == 0:
-        raise ValueError("The uploaded file is empty (0 bytes).")
+        raise ValueError(
+            "The uploaded file is empty (0 bytes)."
+        )
 
     if name.endswith(".pdf"):
         return extract_text_from_pdf(file_bytes)
+
     elif name.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        media_type = "image/png" if name.endswith(".png") else "image/jpeg"
-        return extract_text_from_image(file_bytes, media_type)
+
+        if name.endswith(".png"):
+            media_type = "image/png"
+        elif name.endswith(".webp"):
+            media_type = "image/webp"
+        else:
+            media_type = "image/jpeg"
+
+        return extract_text_from_image(
+            file_bytes,
+            media_type
+        )
+
     elif name.endswith(".txt"):
+
         try:
-            return file_bytes.decode("utf-8", errors="ignore")
+            return file_bytes.decode(
+                "utf-8",
+                errors="ignore"
+            )
+
         except Exception as e:
-            raise ValueError(f"Could not read text file: {e}")
+            raise ValueError(
+                f"Could not read text file: {e}"
+            )
+
     else:
-        raise ValueError(f"Unsupported file type: {name}. Use PDF, PNG, JPG, or TXT.")
+        raise ValueError(
+            f"Unsupported file type: {name}. "
+            "Use PDF, PNG, JPG, WEBP, or TXT."
+        )
 
 
-def extract_structured_data(raw_text: str, max_retries: int = 1) -> dict:
+def extract_structured_data(
+    raw_text: str,
+    max_retries: int = 1
+) -> dict:
     """
-    Send raw document text to Claude and get back structured JSON.
-    Retries once on transient connection errors. Never raises — always
-    returns a dict, with an "error" key set on failure so the UI can show
-    a real message instead of crashing.
+    Send document text to Gemini and return structured JSON.
+
+    Retries once on transient errors.
+    Never raises an exception to the Streamlit UI.
     """
+
     if not raw_text or not raw_text.strip():
-        return {"error": "No text was extracted from the document to analyze."}
+        return {
+            "error": "No text was extracted from the document to analyze."
+        }
 
     last_error = None
-    raw_output = ""
+
     for attempt in range(max_retries + 1):
+
         try:
             client = get_client()
-            response = client.messages.create(
+
+            prompt = f"""
+{SYSTEM_PROMPT}
+
+DOCUMENT TEXT:
+----------------
+{raw_text}
+----------------
+
+Extract the claim information from the document.
+"""
+
+            response = client.models.generate_content(
                 model=MODEL,
-                max_tokens=1000,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": raw_text}],
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=2000,
+                    response_mime_type="application/json",
+                    response_schema=EXTRACTION_SCHEMA,
+                ),
             )
-            raw_output = response.content[0].text.strip()
 
-            if raw_output.startswith("```"):
-                raw_output = raw_output.strip("`")
-                if raw_output.lower().startswith("json"):
-                    raw_output = raw_output[4:].strip()
+            raw_output = response.text.strip()
 
-            return json.loads(raw_output)
+            if not raw_output:
+                return {
+                    "error": "Gemini returned an empty response."
+                }
 
-        except AuthenticationError:
-            return {"error": "Authentication failed — check ANTHROPIC_API_KEY in Replit Secrets."}
-        except APIConnectionError as e:
-            last_error = f"Network error contacting the API: {e}"
-            time.sleep(1)
-            continue
-        except APIStatusError as e:
-            return {"error": f"API error {e.status_code}: {e.message}"}
-        except json.JSONDecodeError:
-            return {"error": "Model did not return valid JSON.", "raw_output": raw_output}
+            # Parse Gemini's structured JSON response.
+            result = json.loads(raw_output)
+
+            return result
+
         except Exception as e:
-            last_error = f"Unexpected error: {e}"
+
+            error_text = str(e)
+
+            # Authentication errors
+            if (
+                "API key" in error_text
+                or "401" in error_text
+                or "403" in error_text
+                or "authentication" in error_text.lower()
+            ):
+                return {
+                    "error": (
+                        "Gemini authentication failed — "
+                        "check GEMINI_API_KEY in Streamlit Secrets."
+                    )
+                }
+
+            # Quota / rate-limit errors
+            if (
+                "429" in error_text
+                or "quota" in error_text.lower()
+                or "rate limit" in error_text.lower()
+            ):
+                return {
+                    "error": (
+                        "Gemini API quota or rate limit reached. "
+                        "Please try again later."
+                    )
+                }
+
+            # JSON parsing error
+            if isinstance(e, json.JSONDecodeError):
+                return {
+                    "error": "Gemini did not return valid JSON.",
+                    "raw_output": raw_output
+                    if "raw_output" in locals()
+                    else "",
+                }
+
+            last_error = f"Gemini API error: {error_text}"
+
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+
             break
 
-    return {"error": last_error or "Extraction failed after retry."}
+    return {
+        "error": last_error or "Extraction failed after retry."
+    }
